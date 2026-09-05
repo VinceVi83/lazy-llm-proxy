@@ -1,0 +1,11 @@
+[Unit]
+Description=WOL wakeup detection and monitoring startup
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=#PROJECT_PATH#/wol-detect.sh
+
+[Install]
+WantedBy=multi-user.target
+

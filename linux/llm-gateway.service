@@ -1,0 +1,16 @@
+[Unit]
+Description=LLM Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=#USER#
+Group=#USER#
+ExecStart=#PYTHON_PATH# #PROJECT_PATH#/llm-gateway.py
+Restart=always
+RestartSec=3
+WorkingDirectory=#PROJECT_PATH#/llm-gateway
+
+[Install]
+WantedBy=multi-user.target
+

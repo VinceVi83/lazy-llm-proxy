@@ -1,0 +1,159 @@
+from pathlib import Path
+from collections import deque
+from xml.parsers.expat import model
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+import ollama
+import threading
+from config.conf_manager import cfg, setup_logging
+import logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
+ACTIVITY_FILE = Path("/tmp/activity.lock")
+
+app = FastAPI()
+
+class LLMRequest(BaseModel):
+    system_prompt: str = ""
+    profile: str = "default"
+    model: Optional[str] = None
+    prompt: str = ""
+    attachments: Optional[List[str]] = None
+    scope: Optional[str] = None
+    think: bool = False
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+
+class LLMResponse(BaseModel):
+    result: str
+
+class LLMService:
+    """
+    Thread-safe service for queued LLM requests via Ollama.
+
+    Operates as follows:
+        1. submit_task enqueues requests with config, Event for synchronization, and result container.
+        2. A single daemon thread processes the queue sequentially via _process_queue.
+        3. Each request calls Ollama's chat API through _call_ollama with model, prompts, and options.
+        4. Results or errors are propagated back through the result container and Event.
+
+    Methods:
+        __init__(self) : Initializes the queue, lock, and processing flag.
+        submit_task(self, config: dict) -> str : Adds a task to the queue and returns its result, with 300s timeout.
+        _process_queue(self) : Processes queued tasks in FIFO order.
+        _call_ollama(self, config: dict) -> str : Invokes Ollama chat API with the given configuration.
+
+    Usage:
+        llm_service = LLMService()
+        response = llm_service.submit_task({"model": "llama3", "text": "Hello"})
+    """
+    def __init__(self):
+        self.queue = deque()
+        self.lock = threading.Lock()
+        self.processing = False
+    
+    def submit_task(self, config: dict) -> str:
+        event = threading.Event()
+        result_container = {"result": None, "error": None}
+        with self.lock:
+            self.queue.append((config, event, result_container))
+        if not self.processing:
+            threading.Thread(target=self._process_queue, daemon=True).start()
+        if not event.wait(timeout=300):
+            raise TimeoutError("LLM request timed out")
+        if result_container["error"]:
+            raise result_container["error"]
+        return result_container["result"]
+    
+    def _process_queue(self):
+        self.processing = True
+        while True:
+            with self.lock:
+                if not self.queue:
+                    self.processing = False
+                    return
+                config, event, result_container = self.queue.popleft()
+            try:
+                result = self._call_ollama(config)
+                result_container["result"] = result
+            except Exception as e:
+                result_container["error"] = e
+            finally:
+                event.set()
+    
+    def _call_ollama(self, config: dict) -> str:
+        options = {}
+        for key in ("temperature", "top_p", "top_k", "max_tokens", "num_predict"):
+            if key in config and config[key] is not None:
+                ollama_key = "num_predict" if key == "max_tokens" else key
+                options[ollama_key] = config[key]
+
+        logger.info(f"Calling Ollama with model: {config.get('model', '????')}, options: {options}")
+        response = ollama.chat(
+            model=config.get("model", "qwen2.5:3b"),
+            messages=[
+                {"role": "system", "content": config.get("system_prompt", "")},
+                {"role": "user", "content": config.get("text", "")}
+            ],
+            options=options
+        )
+        return response["message"]["content"]
+
+llm_service = LLMService()
+
+@app.get("/health")
+async def health():
+    ACTIVITY_FILE.write_text("")
+    return {"status": "ok"}
+
+@app.post("/wol-ack")
+def wol_ack():
+    with open("/tmp/wol", "w") as f:
+        f.write("1")
+    return {"status": "ok"}
+
+@app.get("/models")
+async def list_models():
+    try:
+        models = ollama.list()
+        return {"models": models}
+    except Exception as e:
+        logger.error(f"Error listing models: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/call-llm", response_model=LLMResponse)
+def call_llm(req: LLMRequest):
+    try:
+        config = {
+            "system_prompt": req.system_prompt,
+            "profile": req.profile,
+            "model": req.model or "qwen2.5:7b-instruct-q8_0",
+            "text": req.prompt,
+            "attachments": req.attachments or [],
+            "think": req.think,
+            "temperature": req.temperature or 0.7,
+            "max_tokens": req.max_tokens or 2048,
+            "top_p": req.top_p or 0.9,
+            "top_k": req.top_k or 40,
+        }
+        if req.scope:
+            config["scope"] = req.scope
+
+        ACTIVITY_FILE.write_text("")
+        output = llm_service.submit_task(config)
+        return LLMResponse(result=output)
+    except TimeoutError as te:
+        logger.error(f"LLM Call Timeout: {str(te)}")
+        raise HTTPException(status_code=504, detail=str(te))
+    except Exception as e:
+        logger.error(f"LLM Call Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"LLM Call Error: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
