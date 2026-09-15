@@ -1,12 +1,11 @@
 from pathlib import Path
 from collections import deque
-from xml.parsers.expat import model
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 import ollama
 import threading
-from config.conf_manager import cfg, setup_logging
+from common.conf_manager import cfg, setup_logging
 import logging
 
 setup_logging()
@@ -21,12 +20,7 @@ class LLMRequest(BaseModel):
     model: Optional[str] = None
     prompt: str = ""
     attachments: Optional[List[str]] = None
-    scope: Optional[str] = None
-    think: bool = False
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
+    options: Optional[dict] = None
 
 class LLMResponse(BaseModel):
     result: str
@@ -67,7 +61,10 @@ class LLMService:
             raise TimeoutError("LLM request timed out")
         if result_container["error"]:
             raise result_container["error"]
-        return result_container["result"]
+        result = result_container["result"]
+        if result is None:
+            return "LLM request completed without a result"
+        return result
     
     def _process_queue(self):
         self.processing = True
@@ -87,11 +84,21 @@ class LLMService:
     
     def _call_ollama(self, config: dict) -> str:
         options = {}
-        for key in ("temperature", "top_p", "top_k", "max_tokens", "num_predict"):
-            if key in config and config[key] is not None:
-                ollama_key = "num_predict" if key == "max_tokens" else key
-                options[ollama_key] = config[key]
-
+        user_options = config.get("options", {})
+        
+        option_mapping = {
+            "temperature": "temperature",
+            "top_p": "top_p",
+            "top_k": "top_k",
+            "num_predict": "num_predict",
+            "max_tokens": "num_predict",
+            "think": "think"
+        }
+        
+        for key, ollama_key in option_mapping.items():
+            if key in user_options and user_options[key] is not None:
+                options[ollama_key] = user_options[key]
+        
         logger.info(f"Calling Ollama with model: {config.get('model', '????')}, options: {options}")
         response = ollama.chat(
             model=config.get("model", "qwen2.5:3b"),
@@ -134,14 +141,8 @@ def call_llm(req: LLMRequest):
             "model": req.model or "qwen2.5:7b-instruct-q8_0",
             "text": req.prompt,
             "attachments": req.attachments or [],
-            "think": req.think,
-            "temperature": req.temperature or 0.7,
-            "max_tokens": req.max_tokens or 2048,
-            "top_p": req.top_p or 0.9,
-            "top_k": req.top_k or 40,
+            "options": req.options or {}
         }
-        if req.scope:
-            config["scope"] = req.scope
 
         ACTIVITY_FILE.write_text("")
         output = llm_service.submit_task(config)
@@ -155,5 +156,5 @@ def call_llm(req: LLMRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=cfg.llm_gateway.port)
 
