@@ -12,7 +12,7 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 ACTIVITY_PATH = '/tmp/activity.lock'
-IDLE_SECONDS = 300
+IDLE_SECONDS = 120
 POLL_SECONDS = 10
 
 def is_inactive():
