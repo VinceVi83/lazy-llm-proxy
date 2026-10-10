@@ -218,6 +218,5 @@ def call_llm(req: LLMRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    init_whisper(mode="GPU", lang="fr")
+    init_whisper(mode="CPU", lang="fr")
     uvicorn.run(app, host="0.0.0.0", port=cfg.llm_gateway.port)
-
