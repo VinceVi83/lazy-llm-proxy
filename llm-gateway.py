@@ -9,6 +9,9 @@ import subprocess
 import requests
 import tempfile
 import os
+from urllib.parse import urlparse
+# import urllib3
+# urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from whisper_engine import WhisperEngine
 from common.conf_manager import cfg, setup_logging
 import logging
@@ -120,17 +123,29 @@ def init_whisper(mode="CPU", lang="fr"):
     whisper = WhisperEngine(mode, lang)
 
 def download_audio(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid audio_url: {url!r}",
+        )
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp.close()
     try:
-        r = requests.get(url, timeout=120)
+        logger.info(f"Downloading audio from {url}")
+        r = requests.get(url, timeout=120, verify=False)
         r.raise_for_status()
-        tmp.write(r.content)
-        tmp.close()
+        with open(tmp.name, "wb") as f:
+            f.write(r.content)
         return tmp.name
-    except:
+    except requests.exceptions.RequestException as e:
         if os.path.exists(tmp.name):
             os.unlink(tmp.name)
-        raise
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not fetch audio_url {url!r}: {e}",
+        )
 
 llm_service = LLMService()
 

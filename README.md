@@ -1,20 +1,66 @@
 # LazyLLMProxy
 
-Minimal proxy for local LLMs (Ollama) that automatically puts machines to sleep when idle and wakes them on demand via Wake-on-LAN because your LLMs deserve naps too.
+A small FastAPI gateway for local Ollama inference, with optional audio transcription and Linux Wake-on-LAN (WOL) / inactivity-suspend support. The supplied code uses one Ollama backend; it is not a multi-provider router or plugin framework.
 
-## How it works
-- Centralizes all LLM requests through a single endpoint
-- Routes to available backends (Ollama, etc.)
-- Detects inactivity and suspends the host machine
-- Wakes the machine via WOL when a new request arrives
-- Arms the suspend mechanism via `wol-detect.service` on boot/wake using the `/tmp/wol` marker
+## Features
 
-## Stack
-- Python (FastAPI)
-- Ollama
-- Wake-on-LAN
-- systemd
+- `GET /health`, `GET /models`, `POST /call-llm`, `POST /transcribe`, `POST /transcribe-and-call`, and `POST /wol-ack`.
+- Ollama chat calls use a FIFO queue and run sequentially; callers wait up to 300 seconds.
+- Supported options: `temperature`, `top_p`, `top_k`, `num_predict` (or `max_tokens`), and `think`.
+- Audio is fetched from `audio_url` and transcribed with `faster-whisper`. Script startup initializes Whisper in CPU mode with French.
+- `/health` and `/call-llm` update `/tmp/activity.lock`; `/wol-ack` updates it and starts `auto-suspend.py`.
+- `auto-suspend.py` checks every 10 seconds for 120 seconds of inactivity, then schedules suspend 30 seconds later.
+- `profile` and `attachments` request fields are accepted but unused. Linux systemd/WOL files are under `linux/`.
 
+## Prerequisites
+
+- Linux is required for systemd, `ethtool`, WOL, and `systemctl suspend`.
+- Python 3 and packages in `requirements.txt`.
+- Ollama reachable from the gateway host, with model installed `qwen2.5:7b-instruct-q8_0` and `qwen2.5:3b`.
+
+`requirements.txt` lists NVIDIA CUDA/cuDNN packages, although built-in Whisper startup uses CPU. The external configuration manager and the `llm_client` package imported by tests are not declared pip dependencies.
+
+## Installation
+
+Clone with submodules so the configuration dependency is fetched:
+
+```sh
+git clone --recurse-submodules <REPOSITORY_URL>
+cd lazy-llm-proxy
+# If needed:
+git submodule update --init --recursive
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+## Run
+
+From the repository root, after configuring the external submodule and settings:
+
+```sh
+python3 llm-gateway.py
+```
+
+## Usage examples
+
+Check health (replace host and port):
+
+```sh
+curl -i http://<HOST>:<PORT>/health
+```
+
+Send a chat request:
+
+```sh
+curl -sS -X POST http://<HOST>:<PORT>/call-llm \
+  -H 'Content-Type: application/json' \
+  -d '{"system_prompt":"Answer briefly.","prompt":"Hello","model":"qwen2.5:3b","options":{"temperature":0.2}}'
+```
+
+The chat response includes a `result` string. List models with `GET /models`. Transcription routes accept JSON with `audio_url`; `audio_language` is accepted, but the engine uses its initialized language. `POST /transcribe-and-call` transcribes and sends the text to Ollama. Audio routes need Whisper initialized: the script entry point does this; ASGI module import alone does not.
+
+`POST /wol-ack` is intended to acknowledge WOL and start the inactivity monitor. The gateway has no authentication; do not expose it to an untrusted network.
 
 ## Architecture and flow
 
@@ -38,43 +84,21 @@ RPi: check TCP 9999 --OK--> POST PC:8000/call-llm
 
 `wol-detect.service` is started on each boot by `multi-user.target`. It waits for the local TCP server, then monitors `/tmp/wol` for 18 seconds. A manual start/wake without this marker therefore does not trigger the monitor.
 
-## Files
+The `pc-server/` and `rpi-client/` components are not in the uploaded archive and could not be verified against code.
 
-| File | Responsibility |
+## Repository structure
+
+| Path | Purpose |
 |---|---|
-| `pc-server/wol.service` | Enables WOL wake on `eth0` with `ethtool`. |
-| `pc-server/wakeup-server.service` | Maintains TCP availability server. |
-| `pc-server/wakeup-server.py` | Responds `up` on TCP port 9999 then closes. |
-| `pc-server/wol-detect.service` / `.sh` | Waits for server and detects WOL marker post-boot. |
-| `pc-server/auto-suspend.py` | Monitors inactivity and suspends only after WOL detection. |
-| `pc-server/llm_gateway.py` | REST API placeholder on port 8000. |
-| `rpi-client/llm_gateway_checker.py` | Conditional WOL, waiting, SSH marker and REST call. |
-| `rpi-client/test_wol_flow.py` | Manual test with unconditional WOL and timing. |
+| `llm-gateway.py`, `whisper_engine.py` | FastAPI gateway and Whisper engine |
+| `auto-suspend.py` | Inactivity monitor and delayed suspend |
+| `common/` | Configuration submodule path declared in `.gitmodules` |
+| `configure_paths.py` | Replaces markers in selected local files |
+| `linux/` | systemd templates and `wol-detect.sh` |
+| `tests/` | LLM benchmark and WOL/health checker |
+| `requirements.txt` | Declared Python dependencies |
 
-## Shared markers
+## Credits and license
 
-| Path | Created by | Read/deleted by | Meaning |
-|---|---|---|---|
-| `/tmp/wol` | RPi via SSH, after confirmed WOL wakeup | `wol-detect.sh` reads then deletes it | Allows arming auto-suspend for this cycle. |
-| `/tmp/activity.lock` | `llm_gateway.py` on each POST `/generate` | `auto-suspend.py` only reads `mtime` | Last LLM activity; never touched by `auto-suspend.py`. |
-| `/tmp/inactivity` | `wol-detect.sh` deletes an old marker; `auto-suspend.py` creates it before suspend | `wol-detect.sh` can delete a stale marker | Safeguard indicating an inactivity suspension has been initiated. |
-
-## Parameters
-
-- TCP availability: `9999`.
-- REST API: `8000`, route `POST /generate`.
-- Inactivity threshold: more than `600 s` (10 minutes).
-- Inactivity poll: every `30 s`.
-- WOL detection window: `18 s` (within the requested range of 15-20 s).
-
-The following optional service can be created to launch the gateway on boot: `llm-gateway.service`, with `After=network.target`, `Restart=always`, and `ExecStart=/usr/bin/python3 /opt/wol-system/llm_gateway.py`. It is not provided as a mandatory service in order to keep the gateway explicitly optional.
-
-
-curl -v http://192.168.X.XXX:8000/llm-request
-sudo ufw status verbose
-sudo ufw status numbered
-sudo ufw allow from 192.168.X.XXX/24 to any port 8000 proto tcp
-sudo ufw allow from 192.168.X.XXX/24 to any port 9999 proto tcp
-mkdir -f /etc/systemd/server
-cp /etc/systemd/server/llm-gateway.service
-sudo ln -s /etc/systemd/server/llm-gateway.service  /etc/systemd/system/llm-gateway.service
+Project: LazyLLMProxy.
+Distributed under the MIT License; see [`LICENSE`](LICENSE). Copyright (c) 2026 Vincent NGUYEN.
