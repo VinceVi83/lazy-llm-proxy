@@ -13,10 +13,9 @@ from urllib.parse import urlparse
 # import urllib3
 # urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from whisper_engine import WhisperEngine
-from common.conf_manager import cfg, setup_logging
+from common.conf_manager import cfg
 import logging
 
-setup_logging()
 logger = logging.getLogger(__name__)
 ACTIVITY_FILE = Path("/tmp/activity.lock")
 
